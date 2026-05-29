@@ -1,0 +1,6 @@
+/target
+
+# Internal-only material (design notes, Rust learning notes, dogfooding
+# feedback referencing a private repo) — keep out of the public repo.
+/docs/
+CONTEXT.md
