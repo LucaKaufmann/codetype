@@ -79,6 +79,79 @@ pub fn complete(input: &str) -> Vec<&'static str> {
         .collect()
 }
 
+// -- Palette suggestion metadata ---------------------------------------------
+
+/// Display metadata for a command, surfaced in the palette suggestion list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandInfo {
+    /// Bare command name, e.g. "stats".
+    pub name: &'static str,
+    /// One-line description for the palette.
+    pub description: &'static str,
+    /// Argument shape shown after the name, e.g. "<path>". Empty for no-arg.
+    pub arg: &'static str,
+    /// True for commands that parse but aren't wired up yet (:file, :open).
+    /// The palette marks these "(not yet)" instead of offering them as live.
+    pub available: bool,
+}
+
+/// Metadata for every command, in display order.
+///
+/// INVARIANT: this must list the same names in the same order as [`COMMANDS`].
+/// `command_info_matches_commands_order` (in tests) pins the two together so
+/// they can't silently drift. `open`/`file` are `available: false` because the
+/// app layer's `execute_command` still surfaces a "not yet implemented" notice
+/// for them; `stats`/`quit`/`help` are wired up and therefore `true`.
+const COMMAND_INFO: &[CommandInfo] = &[
+    CommandInfo {
+        name: "open",
+        description: "open a different repo",
+        arg: "<path>",
+        available: false,
+    },
+    CommandInfo {
+        name: "file",
+        description: "jump to a specific file",
+        arg: "<name>",
+        available: false,
+    },
+    CommandInfo {
+        name: "stats",
+        description: "open the session stats view",
+        arg: "",
+        available: true,
+    },
+    CommandInfo {
+        name: "quit",
+        description: "quit codetype",
+        arg: "",
+        available: true,
+    },
+    CommandInfo {
+        name: "help",
+        description: "show keyboard help",
+        arg: "",
+        available: true,
+    },
+];
+
+/// Metadata for the commands matching `input`, in display order. Mirrors
+/// [`complete`] but returns full descriptions/arg-shapes for the palette.
+/// Past the first space (argument territory) returns empty, like `complete`.
+pub fn complete_info(input: &str) -> Vec<CommandInfo> {
+    let names = complete(input);
+    COMMAND_INFO
+        .iter()
+        .copied()
+        .filter(|info| names.contains(&info.name))
+        .collect()
+}
+
+/// Look up a single command's metadata by name (`None` if unknown).
+pub fn info(name: &str) -> Option<CommandInfo> {
+    COMMAND_INFO.iter().copied().find(|i| i.name == name)
+}
+
 // -- Tiny private helpers ----------------------------------------------------
 
 fn arg_required<'a>(name: &'static str, rest: &'a str) -> Result<&'a str, ParseError> {
@@ -250,5 +323,90 @@ mod tests {
             ParseError::UnexpectedArg("quit").to_string(),
             "unexpected argument for :quit"
         );
+    }
+
+    // -- complete_info / info metadata --
+
+    #[test]
+    fn complete_info_empty_returns_all_in_order() {
+        let names: Vec<&str> = complete_info("").iter().map(|i| i.name).collect();
+        assert_eq!(names, vec!["open", "file", "stats", "quit", "help"]);
+    }
+
+    #[test]
+    fn complete_info_just_colon_returns_all() {
+        let names: Vec<&str> = complete_info(":").iter().map(|i| i.name).collect();
+        assert_eq!(names, vec!["open", "file", "stats", "quit", "help"]);
+    }
+
+    #[test]
+    fn complete_info_prefix_filters() {
+        let infos = complete_info(":s");
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name, "stats");
+        assert!(infos[0].available);
+        assert_eq!(infos[0].arg, "");
+    }
+
+    #[test]
+    fn complete_info_past_space_is_empty() {
+        assert_eq!(complete_info(":open ~/"), Vec::<CommandInfo>::new());
+    }
+
+    #[test]
+    fn complete_info_marks_unavailable() {
+        assert_eq!(info("open").unwrap().available, false);
+        assert_eq!(info("file").unwrap().available, false);
+        assert_eq!(info("stats").unwrap().available, true);
+        assert_eq!(info("quit").unwrap().available, true);
+        assert_eq!(info("help").unwrap().available, true);
+    }
+
+    #[test]
+    fn info_lookup_round_trips() {
+        let stats = info("stats").expect("stats is a known command");
+        assert_eq!(stats.name, "stats");
+        assert!(stats.available);
+        assert_eq!(info("nope"), None);
+    }
+
+    #[test]
+    fn command_info_covers_every_command_with_nonempty_descriptions() {
+        // Every command has metadata, and no description is blank.
+        assert_eq!(COMMAND_INFO.len(), COMMANDS.len());
+        for cmd in COMMANDS {
+            let i = info(cmd).expect("every COMMANDS entry has metadata");
+            assert!(!i.description.is_empty(), "{cmd} has an empty description");
+        }
+    }
+
+    #[test]
+    fn command_info_matches_commands_order() {
+        // The guard that the two tables never drift: same names, same order.
+        let info_names: Vec<&str> = COMMAND_INFO.iter().map(|i| i.name).collect();
+        assert_eq!(info_names, COMMANDS.to_vec());
+    }
+
+    #[test]
+    fn command_info_arg_shape_matches_parse() {
+        // Ties metadata to parser truth: arg-shaped commands need an argument,
+        // no-arg commands parse bare.
+        for i in COMMAND_INFO {
+            let bare = format!(":{}", i.name);
+            if i.arg.is_empty() {
+                assert!(
+                    parse(&bare).is_ok(),
+                    "{} has no arg but failed to parse bare",
+                    i.name
+                );
+            } else {
+                assert_eq!(
+                    parse(&bare),
+                    Err(ParseError::MissingArg(i.name)),
+                    "{} has an arg shape but parsed bare",
+                    i.name
+                );
+            }
+        }
     }
 }

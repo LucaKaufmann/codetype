@@ -28,7 +28,7 @@ use crate::engine::{CharStatus, Mode, TypingEngine};
 use crate::exercise::Exercise;
 use crate::extractor::{Extractor, registry};
 use crate::scanner::{self, RepoScanner};
-use crate::stats::{ExerciseStats, StatsCollector};
+use crate::stats::{ExerciseStats, SessionStats, StatsCollector};
 use crate::tour::RepoTour;
 
 /// Debug entry point: build the tour and print the first `count` exercises
@@ -193,7 +193,9 @@ impl Drop for TerminalGuard {
 enum AppState {
     Typing {
         engine: TypingEngine,
-        started: Instant,
+        // None until the first accepted keystroke; the header reads 0:00 and
+        // WPM measures real typing time only.
+        started: Option<Instant>,
     },
     Stats {
         stats: ExerciseStats,
@@ -204,6 +206,12 @@ enum AppState {
         prior: Box<AppState>,
     },
     Help {
+        prior: Box<AppState>,
+    },
+    SessionStats {
+        // The screen that invoked the session-stats overlay (Typing/Stats/etc.).
+        // Any key returns here. The view reads live `session()` at render time,
+        // so it carries no copy of the stats.
         prior: Box<AppState>,
     },
 }
@@ -226,7 +234,7 @@ fn event_loop(
 ) -> anyhow::Result<()> {
     let mut state = AppState::Typing {
         engine: TypingEngine::new_with_mode(initial_exercise, mode),
-        started: Instant::now(),
+        started: None,
     };
     let mut stats_collector = StatsCollector::new();
     let mut notice: Option<String> = None;
@@ -243,8 +251,9 @@ fn event_loop(
             )
         })?;
 
-        // Pop the notice after one frame — it's a brief transient message.
-        notice = None;
+        // The notice is NOT cleared here. It must survive the draw it was set
+        // in (and any 250ms-timeout redraws) so the user can read it. It is
+        // cleared instead at the top of `handle_key` on the next keypress.
 
         // Poll for an event with a small timeout so the elapsed timer in
         // Typing mode can tick visibly.
@@ -283,19 +292,24 @@ fn handle_key(
     notice: &mut Option<String>,
     mode: Mode,
 ) -> Action {
+    // Clear any notice from a previous keypress. A notice set *during* this
+    // call (e.g. a parse error from running a command) is written after this
+    // point, so it survives to the next draw and is cleared only when the
+    // user presses the next key.
+    *notice = None;
+
     match state {
-        AppState::Typing { engine, started } => handle_typing_key(engine, *started, key, stats),
+        AppState::Typing { engine, started } => handle_typing_key(engine, started, key, stats),
         AppState::Stats { exercise, .. } => handle_stats_key(exercise, key, tour, mode),
-        AppState::Palette { input, prior } => {
-            handle_palette_key(input, prior, key, tour, stats, notice)
-        }
+        AppState::Palette { input, prior } => handle_palette_key(input, prior, key, tour, notice),
         AppState::Help { prior } => handle_help_key(prior, key),
+        AppState::SessionStats { prior } => handle_session_stats_key(prior, key),
     }
 }
 
 fn handle_typing_key(
     engine: &mut TypingEngine,
-    started: Instant,
+    started: &mut Option<Instant>,
     key: KeyEvent,
     stats: &mut StatsCollector,
 ) -> Action {
@@ -310,8 +324,18 @@ fn handle_typing_key(
         _ => return Action::Stay,
     }
 
+    // Reaching here means the engine actually processed a keystroke (Esc and
+    // the `_` arm return early). Start the clock on the first accepted
+    // keystroke, not at load, so time spent reading the exercise doesn't count
+    // against WPM.
+    if started.is_none() {
+        *started = Some(Instant::now());
+    }
+
     if engine.is_complete() {
-        let elapsed = started.elapsed();
+        // `started` is always Some here (completing required keystrokes), but
+        // elapsed_or_zero keeps it total.
+        let elapsed = elapsed_or_zero(*started);
         let exercise_stats =
             stats.finish_exercise(engine.errors(), engine.correct_chars_typed(), elapsed);
         Action::To(AppState::Stats {
@@ -328,7 +352,7 @@ fn handle_stats_key(exercise: &Exercise, key: KeyEvent, tour: &mut RepoTour, mod
         KeyCode::Char('n') => start_typing(tour.next(), mode),
         KeyCode::Char('r') => Action::To(AppState::Typing {
             engine: TypingEngine::new_with_mode(exercise.clone(), mode),
-            started: Instant::now(),
+            started: None,
         }),
         // Esc is the canonical quit key (consistent with typing screen).
         // `q` is kept as a hidden alternate for users who prefer it.
@@ -355,7 +379,6 @@ fn handle_palette_key(
     prior: &mut Box<AppState>,
     key: KeyEvent,
     tour: &mut RepoTour,
-    stats: &mut StatsCollector,
     notice: &mut Option<String>,
 ) -> Action {
     match key.code {
@@ -370,7 +393,7 @@ fn handle_palette_key(
         }
         KeyCode::Enter => {
             let parsed = command::parse(input);
-            execute_command(parsed, prior, tour, stats, notice)
+            execute_command(parsed, prior, tour, notice)
         }
         _ => Action::Stay,
     }
@@ -383,11 +406,17 @@ fn handle_help_key(prior: &mut Box<AppState>, key: KeyEvent) -> Action {
     Action::To(std::mem::replace(prior.as_mut(), placeholder_state()))
 }
 
+fn handle_session_stats_key(prior: &mut Box<AppState>, key: KeyEvent) -> Action {
+    // Any key returns to the prior screen. (Esc included — this is an overlay,
+    // not a top-level screen, so Esc here means "dismiss," consistent with Help.)
+    let _ = key;
+    Action::To(std::mem::replace(prior.as_mut(), placeholder_state()))
+}
+
 fn execute_command(
     parsed: Result<Command, ParseError>,
     prior: &mut Box<AppState>,
     tour: &mut RepoTour,
-    stats: &mut StatsCollector,
     notice: &mut Option<String>,
 ) -> Action {
     match parsed {
@@ -395,19 +424,11 @@ fn execute_command(
         Ok(Command::Help) => Action::To(AppState::Help {
             prior: Box::new(std::mem::replace(prior.as_mut(), placeholder_state())),
         }),
-        Ok(Command::Stats) => {
-            // Set a notice surfacing the session-wide totals, then return to
-            // the prior screen so the user can see both.
-            let s = stats.session();
-            *notice = Some(format!(
-                "Session: {} exercises  {} correct chars  {} errors  {:.1}s",
-                s.exercises_completed,
-                s.total_correct_chars,
-                s.total_errors,
-                s.total_time.as_secs_f64()
-            ));
-            Action::To(std::mem::replace(prior.as_mut(), placeholder_state()))
-        }
+        // Open the dedicated session-stats view (was a flashing one-frame
+        // notice). The view reads live `session()` at render time.
+        Ok(Command::Stats) => Action::To(AppState::SessionStats {
+            prior: Box::new(std::mem::replace(prior.as_mut(), placeholder_state())),
+        }),
         Ok(Command::File(_)) | Ok(Command::Open(_)) => {
             *notice = Some("command not yet implemented".to_string());
             Action::To(std::mem::replace(prior.as_mut(), placeholder_state()))
@@ -426,7 +447,7 @@ fn start_typing(next: Option<Exercise>, mode: Mode) -> Action {
     match next {
         Some(ex) => Action::To(AppState::Typing {
             engine: TypingEngine::new_with_mode(ex, mode),
-            started: Instant::now(),
+            started: None,
         }),
         None => Action::Quit, // Tour is exhausted (shouldn't happen — round-robin loops).
     }
@@ -465,7 +486,7 @@ fn dummy_stats_for_help() -> ExerciseStats {
 fn render(
     f: &mut ratatui::Frame,
     state: &AppState,
-    session: &crate::stats::SessionStats,
+    session: &SessionStats,
     notice: Option<&str>,
     repo_label: &str,
     language: &str,
@@ -484,26 +505,28 @@ fn render(
     f.render_widget(header(state, session, repo_label, language), chunks[0]);
     match state {
         AppState::Typing { engine, started } => {
-            f.render_widget(typing_body(engine, started.elapsed()), chunks[1])
+            f.render_widget(typing_body(engine, elapsed_or_zero(*started)), chunks[1])
         }
         AppState::Stats { stats, exercise } => {
             f.render_widget(stats_body(stats, exercise), chunks[1])
         }
         AppState::Palette { input, prior } => {
-            // Render the prior state's body underneath, then overlay the palette.
+            // Render the prior state's body underneath, then overlay the palette
+            // (input prompt + live suggestion list) over it.
             match prior.as_ref() {
                 AppState::Typing { engine, started } => {
-                    f.render_widget(typing_body(engine, started.elapsed()), chunks[1]);
+                    f.render_widget(typing_body(engine, elapsed_or_zero(*started)), chunks[1]);
                 }
                 AppState::Stats { stats, exercise } => {
                     f.render_widget(stats_body(stats, exercise), chunks[1]);
                 }
                 _ => {}
             }
-            f.render_widget(palette_line(input), chunks[3]);
+            f.render_widget(palette_overlay(input), chunks[1]);
             return;
         }
         AppState::Help { .. } => f.render_widget(help_body(), chunks[1]),
+        AppState::SessionStats { .. } => f.render_widget(session_stats_body(session), chunks[1]),
     }
 
     if let Some(msg) = notice {
@@ -514,14 +537,14 @@ fn render(
 
 fn header<'a>(
     state: &'a AppState,
-    session: &'a crate::stats::SessionStats,
+    session: &'a SessionStats,
     repo_label: &'a str,
     language: &'a str,
 ) -> Paragraph<'a> {
     let (file, elapsed_label) = match state {
         AppState::Typing { engine, started } => (
             exercise_label(engine.exercise()),
-            format!("  {}", format_elapsed(started.elapsed())),
+            format!("  {}", format_elapsed(elapsed_or_zero(*started))),
         ),
         AppState::Stats { exercise, stats } => (
             exercise_label(exercise),
@@ -530,7 +553,7 @@ fn header<'a>(
         AppState::Palette { prior, .. } => match prior.as_ref() {
             AppState::Typing { engine, started } => (
                 exercise_label(engine.exercise()),
-                format!("  {}", format_elapsed(started.elapsed())),
+                format!("  {}", format_elapsed(elapsed_or_zero(*started))),
             ),
             AppState::Stats { exercise, stats } => (
                 exercise_label(exercise),
@@ -539,6 +562,7 @@ fn header<'a>(
             _ => (String::new(), String::new()),
         },
         AppState::Help { .. } => ("help".to_string(), String::new()),
+        AppState::SessionStats { .. } => ("session".to_string(), String::new()),
     };
 
     let session_summary = format!(
@@ -693,7 +717,7 @@ fn help_body() -> Paragraph<'static> {
         Line::from("            :   open command palette"),
         Line::from("            ?   this help"),
         Line::default(),
-        Line::from("  Palette:  :quit · :stats · :help · :file (not yet) · :open (not yet)"),
+        Line::from("  Palette:  type ':' then a command — suggestions appear inline"),
         Line::default(),
         Line::from(Span::styled(
             "  press any key to return",
@@ -703,15 +727,77 @@ fn help_body() -> Paragraph<'static> {
     Paragraph::new(Text::from(lines))
 }
 
-fn palette_line(input: &str) -> Paragraph<'_> {
-    Paragraph::new(Line::from(vec![
-        Span::styled(":", Style::default().fg(Color::Cyan)),
-        Span::raw(input),
-        Span::styled(
-            "_",
-            Style::default().add_modifier(Modifier::SLOW_BLINK | Modifier::DIM),
-        ),
-    ]))
+/// The palette as drawn over the body: the `:` input line plus a live,
+/// filtered suggestion list (full vocabulary on bare ':'). Each row shows
+/// `:name <arg>  — description`, with not-yet-wired commands marked "(not yet)".
+/// Descriptions/arg-shapes come from `command::complete_info` — never hardcoded
+/// here, so the palette and the parser can't drift.
+fn palette_overlay(input: &str) -> Paragraph<'_> {
+    let mut lines = vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled(":", Style::default().fg(Color::Cyan)),
+            Span::raw(input.to_string()),
+            Span::styled(
+                "_",
+                Style::default().add_modifier(Modifier::SLOW_BLINK | Modifier::DIM),
+            ),
+        ]),
+        Line::default(),
+    ];
+    for info in command::complete_info(input) {
+        let usage = if info.arg.is_empty() {
+            format!("  :{}", info.name)
+        } else {
+            format!("  :{} {}", info.name, info.arg)
+        };
+        let mut spans = vec![
+            Span::styled(usage, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("  — {}", info.description),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        if !info.available {
+            spans.push(Span::styled("  (not yet)", Style::default().fg(Color::Red)));
+        }
+        lines.push(Line::from(spans));
+    }
+    Paragraph::new(Text::from(lines))
+}
+
+/// The session-stats overlay body. Reuses `cumulative_cpm`/`session_wpm`/
+/// `session_accuracy` so the displayed aggregates never diverge from the
+/// engine's per-exercise math basis.
+fn session_stats_body(s: &SessionStats) -> Paragraph<'_> {
+    let lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "  session stats",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(format!("  Exercises completed   {}", s.exercises_completed)),
+        Line::from(format!("  Correct characters    {}", s.total_correct_chars)),
+        Line::from(format!("  Errors                {}", s.total_errors)),
+        Line::from(format!(
+            "  Total time            {}",
+            format_elapsed(s.total_time)
+        )),
+        Line::from(format!("  WPM (session)         {:.1}", session_wpm(s))),
+        Line::from(format!(
+            "  Accuracy (session)    {:.1}%",
+            session_accuracy(s) * 100.0
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "  press any key to return",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    Paragraph::new(Text::from(lines))
 }
 
 fn notice_line(msg: &str) -> Paragraph<'_> {
@@ -729,6 +815,7 @@ fn footer(state: &AppState) -> Paragraph<'static> {
         AppState::Stats { .. } => "",
         AppState::Palette { .. } => "Esc: cancel  ·  Enter: run",
         AppState::Help { .. } => "any key to return  ·  q: quit",
+        AppState::SessionStats { .. } => "any key to return",
     };
     Paragraph::new(Span::styled(hints, Style::default().fg(Color::DarkGray)))
 }
@@ -765,11 +852,86 @@ fn format_elapsed(d: Duration) -> String {
     format!("{mins}:{secs:02}")
 }
 
-fn cumulative_cpm(s: &crate::stats::SessionStats) -> f64 {
+fn cumulative_cpm(s: &SessionStats) -> f64 {
     let minutes = s.total_time.as_secs_f64() / 60.0;
     if minutes == 0.0 {
         0.0
     } else {
         s.total_correct_chars as f64 / minutes
+    }
+}
+
+/// Elapsed wall-clock for a maybe-started timer. `None` (not yet typed) reads
+/// as zero so the header shows 0:00 before the first keystroke.
+fn elapsed_or_zero(started: Option<Instant>) -> Duration {
+    started.map_or(Duration::ZERO, |t| t.elapsed())
+}
+
+/// Aggregate session WPM from cumulative cpm. Divides by 5.0 (the
+/// `CHARS_PER_WORD` basis `stats::wpm` uses; it's private to stats.rs so we
+/// can't import the constant). Reuses `cumulative_cpm` so the two never diverge.
+fn session_wpm(s: &SessionStats) -> f64 {
+    cumulative_cpm(s) / 5.0
+}
+
+/// Aggregate accuracy across the session: correct / (correct + errors).
+/// Mirrors `stats::accuracy`; 100% when no keystrokes attempted.
+fn session_accuracy(s: &SessionStats) -> f64 {
+    let total = s.total_correct_chars + s.total_errors;
+    if total == 0 {
+        1.0
+    } else {
+        s.total_correct_chars as f64 / total as f64
+    }
+}
+
+// -- Tests --------------------------------------------------------------------
+//
+// UI/rendering code stays untested per project convention. These cover only
+// the *pure* logic seams we extracted: the timer math and the session-stat
+// aggregates. No terminal, no AppState construction.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elapsed_or_zero_none_is_zero() {
+        assert_eq!(elapsed_or_zero(None), Duration::ZERO);
+    }
+
+    #[test]
+    fn elapsed_or_zero_some_is_nonnegative() {
+        // Just proves it reads the instant (not the ZERO path). A freshly
+        // captured `now` can't have elapsed a whole second by the next line.
+        let d = elapsed_or_zero(Some(Instant::now()));
+        assert!(d < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn session_wpm_is_cpm_over_five() {
+        let s = SessionStats {
+            exercises_completed: 1,
+            total_correct_chars: 300,
+            total_errors: 0,
+            total_time: Duration::from_secs(60),
+        };
+        // 300 chars / 1 min = 300 cpm; /5 chars-per-word = 60 wpm.
+        assert_eq!(cumulative_cpm(&s), 300.0);
+        assert_eq!(session_wpm(&s), 60.0);
+    }
+
+    #[test]
+    fn session_accuracy_basic() {
+        let s = SessionStats {
+            exercises_completed: 1,
+            total_correct_chars: 40,
+            total_errors: 10,
+            total_time: Duration::from_secs(1),
+        };
+        assert_eq!(session_accuracy(&s), 0.8);
+
+        // No keystrokes attempted → 100% (avoids 0/0).
+        let empty = SessionStats::default();
+        assert_eq!(session_accuracy(&empty), 1.0);
     }
 }
