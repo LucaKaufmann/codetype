@@ -31,7 +31,26 @@ Findings **#1–#4 were fixed** in the follow-up commit on this branch
   palette), via a new `Command::name()`. This also gives the previously-dead
   `command::info()` a real production caller.
 
-Findings **#5–#9 remain open** (minor / altitude polish).
+Findings **#5–#9 were also fixed** in a second follow-up commit
+(185 tests pass, clippy + fmt clean):
+
+- **#5** — the timer now starts only on a real typing attempt (`Char`/`Enter`),
+  not on a `Backspace` pressed while orienting (`handle_typing_key`).
+- **#6** — `COMMAND_INFO` is now the single source of truth: the `COMMANDS`
+  const is gone, `parse` looks commands up there and derives the arg-required
+  rule from each entry's `arg` shape, and a round-trip test couples the table
+  to the `Command` enum.
+- **#7** — extracted `take_prior` / `return_to_prior` helpers; every
+  overlay-dismiss and overlay-open site now calls them instead of repeating
+  `std::mem::replace(prior.as_mut(), placeholder_state())`. (A full `Overlay`
+  type was judged over-engineering for two overlays.)
+- **#8** — a notice now persists until the next *meaningful* keypress: it's
+  cleared only when the key produces an action (not `Stay`) and wasn't set this
+  turn, so no-op keys no longer dismiss it.
+- **#9** — `complete_info` filters `COMMAND_INFO` by prefix directly (no more
+  `complete()` + O(n²) `contains` scan); `complete` is now a thin wrapper.
+
+All nine findings resolved.
 
 ---
 

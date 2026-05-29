@@ -17,9 +17,9 @@ pub enum Command {
 }
 
 impl Command {
-    /// The bare command name (matches the `name` in [`COMMANDS`] and
-    /// [`COMMAND_INFO`]). Lets callers look a parsed command up in its
-    /// metadata — e.g. to check [`CommandInfo::available`].
+    /// The bare command name (matches the `name` in [`COMMAND_INFO`]). Lets
+    /// callers look a parsed command up in its metadata — e.g. to check
+    /// [`CommandInfo::available`].
     pub fn name(&self) -> &'static str {
         match self {
             Command::Open(_) => "open",
@@ -43,13 +43,12 @@ pub enum ParseError {
     UnexpectedArg(&'static str),
 }
 
-/// The command vocabulary, in display order.
-const COMMANDS: &[&str] = &["open", "file", "stats", "quit", "help"];
-
 /// Parse a command-palette line into a [`Command`].
 ///
 /// Accepts input with or without a leading `:`. Surrounding whitespace is
-/// trimmed; internal whitespace in arguments is preserved.
+/// trimmed; internal whitespace in arguments is preserved. Whether a command
+/// takes an argument is derived from its [`COMMAND_INFO`] entry (the single
+/// source of truth), so the parser and the palette's arg hints can't disagree.
 pub fn parse(input: &str) -> Result<Command, ParseError> {
     let body = input.trim().trim_start_matches(':').trim_start();
     if body.is_empty() {
@@ -64,34 +63,40 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         None => (body, ""),
     };
 
-    match cmd {
-        "open" => arg_required("open", rest).map(|s| Command::Open(s.to_string())),
-        "file" => arg_required("file", rest).map(|s| Command::File(s.to_string())),
-        "stats" => no_arg("stats", rest).map(|()| Command::Stats),
-        "quit" => no_arg("quit", rest).map(|()| Command::Quit),
-        "help" => no_arg("help", rest).map(|()| Command::Help),
-        other => Err(ParseError::Unknown(other.to_string())),
-    }
+    let info = COMMAND_INFO
+        .iter()
+        .find(|i| i.name == cmd)
+        .ok_or_else(|| ParseError::Unknown(cmd.to_string()))?;
+
+    // Validate the argument against the metadata's `arg` shape (non-empty =>
+    // an argument is required).
+    let arg = if info.arg.is_empty() {
+        if !rest.is_empty() {
+            return Err(ParseError::UnexpectedArg(info.name));
+        }
+        None
+    } else if rest.is_empty() {
+        return Err(ParseError::MissingArg(info.name));
+    } else {
+        Some(rest.to_string())
+    };
+
+    // The one inherently per-variant step: build the typed `Command`. `cmd`
+    // matched a `COMMAND_INFO` entry above, so the catch-all is unreachable.
+    Ok(match info.name {
+        "open" => Command::Open(arg.expect("open requires an arg per its metadata")),
+        "file" => Command::File(arg.expect("file requires an arg per its metadata")),
+        "stats" => Command::Stats,
+        "quit" => Command::Quit,
+        "help" => Command::Help,
+        other => unreachable!("COMMAND_INFO entry {other:?} has no Command constructor"),
+    })
 }
 
 /// Return the command names that match a partial input, in display order.
-///
-/// `complete(":")` and `complete("")` both return every command. If the
-/// input already contains a space (i.e. the user has moved past the command
-/// name into the argument), this function returns an empty `Vec` — argument
-/// completion is the app layer's concern.
+/// Thin wrapper over [`complete_info`] for callers that only need names.
 pub fn complete(input: &str) -> Vec<&'static str> {
-    let body = input.trim_start().trim_start_matches(':');
-
-    if body.contains(' ') {
-        return Vec::new();
-    }
-
-    COMMANDS
-        .iter()
-        .copied()
-        .filter(|cmd| cmd.starts_with(body))
-        .collect()
+    complete_info(input).into_iter().map(|i| i.name).collect()
 }
 
 // -- Palette suggestion metadata ---------------------------------------------
@@ -110,13 +115,12 @@ pub struct CommandInfo {
     pub available: bool,
 }
 
-/// Metadata for every command, in display order.
-///
-/// INVARIANT: this must list the same names in the same order as [`COMMANDS`].
-/// `command_info_matches_commands_order` (in tests) pins the two together so
-/// they can't silently drift. `open`/`file` are `available: false` because the
-/// app layer's `execute_command` still surfaces a "not yet implemented" notice
-/// for them; `stats`/`quit`/`help` are wired up and therefore `true`.
+/// Metadata for every command, in display order. **This is the single source
+/// of truth for the command vocabulary**: `parse` derives names + arg-shapes
+/// from it, `complete`/`complete_info` filter it, and `app::execute_command`
+/// reads `available` to decide what's wired up. `open`/`file` are
+/// `available: false` (not implemented yet) and the palette marks them
+/// "(not yet)"; `stats`/`quit`/`help` are `true`.
 const COMMAND_INFO: &[CommandInfo] = &[
     CommandInfo {
         name: "open",
@@ -150,39 +154,25 @@ const COMMAND_INFO: &[CommandInfo] = &[
     },
 ];
 
-/// Metadata for the commands matching `input`, in display order. Mirrors
-/// [`complete`] but returns full descriptions/arg-shapes for the palette.
-/// Past the first space (argument territory) returns empty, like `complete`.
+/// Metadata for the commands whose name matches `input`'s prefix, in display
+/// order — the primitive the palette renders. `complete_info(":")` and
+/// `complete_info("")` return every command; once the input contains a space
+/// (the user has moved into argument territory) it returns empty.
 pub fn complete_info(input: &str) -> Vec<CommandInfo> {
-    let names = complete(input);
+    let body = input.trim_start().trim_start_matches(':');
+    if body.contains(' ') {
+        return Vec::new();
+    }
     COMMAND_INFO
         .iter()
         .copied()
-        .filter(|info| names.contains(&info.name))
+        .filter(|info| info.name.starts_with(body))
         .collect()
 }
 
 /// Look up a single command's metadata by name (`None` if unknown).
 pub fn info(name: &str) -> Option<CommandInfo> {
     COMMAND_INFO.iter().copied().find(|i| i.name == name)
-}
-
-// -- Tiny private helpers ----------------------------------------------------
-
-fn arg_required<'a>(name: &'static str, rest: &'a str) -> Result<&'a str, ParseError> {
-    if rest.is_empty() {
-        Err(ParseError::MissingArg(name))
-    } else {
-        Ok(rest)
-    }
-}
-
-fn no_arg(name: &'static str, rest: &str) -> Result<(), ParseError> {
-    if rest.is_empty() {
-        Ok(())
-    } else {
-        Err(ParseError::UnexpectedArg(name))
-    }
 }
 
 #[cfg(test)]
@@ -386,20 +376,27 @@ mod tests {
     }
 
     #[test]
-    fn command_info_covers_every_command_with_nonempty_descriptions() {
-        // Every command has metadata, and no description is blank.
-        assert_eq!(COMMAND_INFO.len(), COMMANDS.len());
-        for cmd in COMMANDS {
-            let i = info(cmd).expect("every COMMANDS entry has metadata");
-            assert!(!i.description.is_empty(), "{cmd} has an empty description");
+    fn command_info_descriptions_are_nonempty() {
+        // The single source of truth: every entry has a usable description.
+        for i in COMMAND_INFO {
+            assert!(!i.description.is_empty(), "{} has an empty description", i.name);
         }
     }
 
     #[test]
-    fn command_info_matches_commands_order() {
-        // The guard that the two tables never drift: same names, same order.
-        let info_names: Vec<&str> = COMMAND_INFO.iter().map(|i| i.name).collect();
-        assert_eq!(info_names, COMMANDS.to_vec());
+    fn every_command_info_name_parses_and_round_trips() {
+        // Couples the metadata table to the `Command` enum: each entry must
+        // name a real, parseable command whose `name()` maps back to it. Adding
+        // a COMMAND_INFO entry without a matching Command constructor fails here.
+        for i in COMMAND_INFO {
+            let input = if i.arg.is_empty() {
+                format!(":{}", i.name)
+            } else {
+                format!(":{} x", i.name)
+            };
+            let cmd = parse(&input).expect("COMMAND_INFO entry should parse");
+            assert_eq!(cmd.name(), i.name);
+        }
     }
 
     #[test]

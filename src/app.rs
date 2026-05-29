@@ -292,19 +292,27 @@ fn handle_key(
     notice: &mut Option<String>,
     mode: Mode,
 ) -> Action {
-    // Clear any notice from a previous keypress. A notice set *during* this
-    // call (e.g. a parse error from running a command) is written after this
-    // point, so it survives to the next draw and is cleared only when the
-    // user presses the next key.
-    *notice = None;
+    // Snapshot the notice so we can tell a *pre-existing* message (to dismiss
+    // once the user acts) from one this keypress sets (to keep).
+    let notice_before = notice.clone();
 
-    match state {
+    let action = match state {
         AppState::Typing { engine, started } => handle_typing_key(engine, started, key, stats),
         AppState::Stats { exercise, .. } => handle_stats_key(exercise, key, tour, mode),
         AppState::Palette { input, prior } => handle_palette_key(input, prior, key, tour, notice),
         AppState::Help { prior } => handle_help_key(prior, key),
         AppState::SessionStats { prior } => handle_session_stats_key(prior, key),
+    };
+
+    // Notice lifetime: a notice this keypress just set (so `*notice` changed)
+    // persists to the next draw. A pre-existing notice is dismissed only when
+    // the user presses a key that *does* something (any action other than
+    // Stay) — a no-op key leaves it on screen to keep reading.
+    if *notice == notice_before && !matches!(action, Action::Stay) {
+        *notice = None;
     }
+
+    action
 }
 
 fn handle_typing_key(
@@ -313,6 +321,11 @@ fn handle_typing_key(
     key: KeyEvent,
     stats: &mut StatsCollector,
 ) -> Action {
+    // A forward typing attempt (Char/Enter) starts the clock; Backspace (a
+    // correction) does not. A *wrong* key still counts — it's a genuine
+    // attempt — so we key off the kind of key, not whether the cursor moved.
+    let is_typing_attempt = matches!(key.code, KeyCode::Char(_) | KeyCode::Enter);
+
     match key.code {
         KeyCode::Esc => {
             // Bail mid-exercise: drop the engine and quit on Esc.
@@ -324,11 +337,10 @@ fn handle_typing_key(
         _ => return Action::Stay,
     }
 
-    // Reaching here means the engine actually processed a keystroke (Esc and
-    // the `_` arm return early). Start the clock on the first accepted
-    // keystroke, not at load, so time spent reading the exercise doesn't count
-    // against WPM.
-    if started.is_none() {
+    // Start the clock on the first real typing attempt — not at load (so read
+    // time doesn't count) and not on a Backspace pressed while orienting (so a
+    // stray correction before any typing doesn't either).
+    if is_typing_attempt && started.is_none() {
         *started = Some(Instant::now());
     }
 
@@ -382,7 +394,7 @@ fn handle_palette_key(
     notice: &mut Option<String>,
 ) -> Action {
     match key.code {
-        KeyCode::Esc => Action::To(std::mem::replace(prior.as_mut(), placeholder_state())),
+        KeyCode::Esc => return_to_prior(prior),
         KeyCode::Backspace => {
             input.pop();
             Action::Stay
@@ -403,14 +415,14 @@ fn handle_help_key(prior: &mut Box<AppState>, key: KeyEvent) -> Action {
     if let KeyCode::Char('q') = key.code {
         return Action::Quit;
     }
-    Action::To(std::mem::replace(prior.as_mut(), placeholder_state()))
+    return_to_prior(prior)
 }
 
 fn handle_session_stats_key(prior: &mut Box<AppState>, key: KeyEvent) -> Action {
     // Any key returns to the prior screen. (Esc included — this is an overlay,
     // not a top-level screen, so Esc here means "dismiss," consistent with Help.)
     let _ = key;
-    Action::To(std::mem::replace(prior.as_mut(), placeholder_state()))
+    return_to_prior(prior)
 }
 
 fn execute_command(
@@ -426,7 +438,7 @@ fn execute_command(
             // Parse error: surface it and return to prior so the user can
             // read the notice and try again.
             *notice = Some(format!("error: {e}"));
-            return Action::To(std::mem::replace(prior.as_mut(), placeholder_state()));
+            return return_to_prior(prior);
         }
     };
 
@@ -436,24 +448,24 @@ fn execute_command(
     // list — keeps the rejection and the palette's markers from drifting apart.
     if !command::info(command.name()).is_some_and(|i| i.available) {
         *notice = Some("command not yet implemented".to_string());
-        return Action::To(std::mem::replace(prior.as_mut(), placeholder_state()));
+        return return_to_prior(prior);
     }
 
     match command {
         Command::Quit => Action::Quit,
         Command::Help => Action::To(AppState::Help {
-            prior: Box::new(std::mem::replace(prior.as_mut(), placeholder_state())),
+            prior: Box::new(take_prior(prior)),
         }),
         // Dedicated session-stats view (was a flashing one-frame notice). The
         // view reads live `session()` at render time.
         Command::Stats => Action::To(AppState::SessionStats {
-            prior: Box::new(std::mem::replace(prior.as_mut(), placeholder_state())),
+            prior: Box::new(take_prior(prior)),
         }),
         // Filtered out by the `available` gate above; handled defensively
         // (not `unreachable!`) so flipping a metadata flag can't panic.
         Command::File(_) | Command::Open(_) => {
             *notice = Some("command not yet implemented".to_string());
-            Action::To(std::mem::replace(prior.as_mut(), placeholder_state()))
+            return_to_prior(prior)
         }
     }
 }
@@ -482,6 +494,18 @@ fn placeholder_state() -> AppState {
             },
         }),
     }
+}
+
+/// Move the screen out of a `prior: Box<AppState>` (overlays — Palette, Help,
+/// SessionStats — box the screen they were opened over). We can't move out of
+/// a `&mut`, so we swap a `placeholder_state()` in and return the real prior.
+fn take_prior(prior: &mut Box<AppState>) -> AppState {
+    std::mem::replace(prior.as_mut(), placeholder_state())
+}
+
+/// Dismiss an overlay back to the screen it was opened over.
+fn return_to_prior(prior: &mut Box<AppState>) -> Action {
+    Action::To(take_prior(prior))
 }
 
 fn dummy_stats_for_help() -> ExerciseStats {
