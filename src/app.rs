@@ -419,25 +419,40 @@ fn execute_command(
     tour: &mut RepoTour,
     notice: &mut Option<String>,
 ) -> Action {
-    match parsed {
-        Ok(Command::Quit) => Action::Quit,
-        Ok(Command::Help) => Action::To(AppState::Help {
-            prior: Box::new(std::mem::replace(prior.as_mut(), placeholder_state())),
-        }),
-        // Open the dedicated session-stats view (was a flashing one-frame
-        // notice). The view reads live `session()` at render time.
-        Ok(Command::Stats) => Action::To(AppState::SessionStats {
-            prior: Box::new(std::mem::replace(prior.as_mut(), placeholder_state())),
-        }),
-        Ok(Command::File(_)) | Ok(Command::Open(_)) => {
-            *notice = Some("command not yet implemented".to_string());
-            Action::To(std::mem::replace(prior.as_mut(), placeholder_state()))
-        }
+    let _ = tour;
+    let command = match parsed {
+        Ok(command) => command,
         Err(e) => {
+            // Parse error: surface it and return to prior so the user can
+            // read the notice and try again.
             *notice = Some(format!("error: {e}"));
-            // On parse error, also return to prior — the user will see the
-            // notice and can try again.
-            let _ = tour;
+            return Action::To(std::mem::replace(prior.as_mut(), placeholder_state()));
+        }
+    };
+
+    // Single source of truth for "is this command wired up?": the command
+    // metadata's `available` flag (the same flag the palette uses to mark
+    // commands "(not yet)"). Gating here — rather than a separate hardcoded
+    // list — keeps the rejection and the palette's markers from drifting apart.
+    if !command::info(command.name()).is_some_and(|i| i.available) {
+        *notice = Some("command not yet implemented".to_string());
+        return Action::To(std::mem::replace(prior.as_mut(), placeholder_state()));
+    }
+
+    match command {
+        Command::Quit => Action::Quit,
+        Command::Help => Action::To(AppState::Help {
+            prior: Box::new(std::mem::replace(prior.as_mut(), placeholder_state())),
+        }),
+        // Dedicated session-stats view (was a flashing one-frame notice). The
+        // view reads live `session()` at render time.
+        Command::Stats => Action::To(AppState::SessionStats {
+            prior: Box::new(std::mem::replace(prior.as_mut(), placeholder_state())),
+        }),
+        // Filtered out by the `available` gate above; handled defensively
+        // (not `unreachable!`) so flipping a metadata flag can't panic.
+        Command::File(_) | Command::Open(_) => {
+            *notice = Some("command not yet implemented".to_string());
             Action::To(std::mem::replace(prior.as_mut(), placeholder_state()))
         }
     }
@@ -510,21 +525,12 @@ fn render(
         AppState::Stats { stats, exercise } => {
             f.render_widget(stats_body(stats, exercise), chunks[1])
         }
-        AppState::Palette { input, prior } => {
-            // Render the prior state's body underneath, then overlay the palette
-            // (input prompt + live suggestion list) over it.
-            match prior.as_ref() {
-                AppState::Typing { engine, started } => {
-                    f.render_widget(typing_body(engine, elapsed_or_zero(*started)), chunks[1]);
-                }
-                AppState::Stats { stats, exercise } => {
-                    f.render_widget(stats_body(stats, exercise), chunks[1]);
-                }
-                _ => {}
-            }
-            f.render_widget(palette_overlay(input), chunks[1]);
-            return;
-        }
+        // The palette is a focused mode that owns the body region. We do NOT
+        // draw the prior screen underneath: `palette_overlay` is a plain
+        // Paragraph (no Clear/background), so anything drawn under it would
+        // bleed through the cells it doesn't paint. Falling through (no early
+        // return) lets the footer render its "Esc: cancel · Enter: run" hint.
+        AppState::Palette { input, .. } => f.render_widget(palette_overlay(input), chunks[1]),
         AppState::Help { .. } => f.render_widget(help_body(), chunks[1]),
         AppState::SessionStats { .. } => f.render_widget(session_stats_body(session), chunks[1]),
     }
@@ -568,7 +574,7 @@ fn header<'a>(
     let session_summary = format!(
         "  ·  session: {} ex / {:.0} cpm",
         session.exercises_completed,
-        cumulative_cpm(session),
+        session.cpm(),
     );
 
     Paragraph::new(Line::from(vec![
@@ -766,9 +772,9 @@ fn palette_overlay(input: &str) -> Paragraph<'_> {
     Paragraph::new(Text::from(lines))
 }
 
-/// The session-stats overlay body. Reuses `cumulative_cpm`/`session_wpm`/
-/// `session_accuracy` so the displayed aggregates never diverge from the
-/// engine's per-exercise math basis.
+/// The session-stats overlay body. Reads the aggregates straight off
+/// [`SessionStats`] (`cpm`/`wpm`/`accuracy`), which share the same math as the
+/// per-Exercise stats, so the two screens can never diverge.
 fn session_stats_body(s: &SessionStats) -> Paragraph<'_> {
     let lines = vec![
         Line::default(),
@@ -786,10 +792,10 @@ fn session_stats_body(s: &SessionStats) -> Paragraph<'_> {
             "  Total time            {}",
             format_elapsed(s.total_time)
         )),
-        Line::from(format!("  WPM (session)         {:.1}", session_wpm(s))),
+        Line::from(format!("  WPM (session)         {:.1}", s.wpm())),
         Line::from(format!(
             "  Accuracy (session)    {:.1}%",
-            session_accuracy(s) * 100.0
+            s.accuracy() * 100.0
         )),
         Line::default(),
         Line::from(Span::styled(
@@ -852,37 +858,11 @@ fn format_elapsed(d: Duration) -> String {
     format!("{mins}:{secs:02}")
 }
 
-fn cumulative_cpm(s: &SessionStats) -> f64 {
-    let minutes = s.total_time.as_secs_f64() / 60.0;
-    if minutes == 0.0 {
-        0.0
-    } else {
-        s.total_correct_chars as f64 / minutes
-    }
-}
 
 /// Elapsed wall-clock for a maybe-started timer. `None` (not yet typed) reads
 /// as zero so the header shows 0:00 before the first keystroke.
 fn elapsed_or_zero(started: Option<Instant>) -> Duration {
     started.map_or(Duration::ZERO, |t| t.elapsed())
-}
-
-/// Aggregate session WPM from cumulative cpm. Divides by 5.0 (the
-/// `CHARS_PER_WORD` basis `stats::wpm` uses; it's private to stats.rs so we
-/// can't import the constant). Reuses `cumulative_cpm` so the two never diverge.
-fn session_wpm(s: &SessionStats) -> f64 {
-    cumulative_cpm(s) / 5.0
-}
-
-/// Aggregate accuracy across the session: correct / (correct + errors).
-/// Mirrors `stats::accuracy`; 100% when no keystrokes attempted.
-fn session_accuracy(s: &SessionStats) -> f64 {
-    let total = s.total_correct_chars + s.total_errors;
-    if total == 0 {
-        1.0
-    } else {
-        s.total_correct_chars as f64 / total as f64
-    }
 }
 
 // -- Tests --------------------------------------------------------------------
@@ -907,31 +887,4 @@ mod tests {
         assert!(d < Duration::from_secs(1));
     }
 
-    #[test]
-    fn session_wpm_is_cpm_over_five() {
-        let s = SessionStats {
-            exercises_completed: 1,
-            total_correct_chars: 300,
-            total_errors: 0,
-            total_time: Duration::from_secs(60),
-        };
-        // 300 chars / 1 min = 300 cpm; /5 chars-per-word = 60 wpm.
-        assert_eq!(cumulative_cpm(&s), 300.0);
-        assert_eq!(session_wpm(&s), 60.0);
-    }
-
-    #[test]
-    fn session_accuracy_basic() {
-        let s = SessionStats {
-            exercises_completed: 1,
-            total_correct_chars: 40,
-            total_errors: 10,
-            total_time: Duration::from_secs(1),
-        };
-        assert_eq!(session_accuracy(&s), 0.8);
-
-        // No keystrokes attempted → 100% (avoids 0/0).
-        let empty = SessionStats::default();
-        assert_eq!(session_accuracy(&empty), 1.0);
-    }
 }

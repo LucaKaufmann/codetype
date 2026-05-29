@@ -16,6 +16,21 @@ pub enum Command {
     Help,
 }
 
+impl Command {
+    /// The bare command name (matches the `name` in [`COMMANDS`] and
+    /// [`COMMAND_INFO`]). Lets callers look a parsed command up in its
+    /// metadata — e.g. to check [`CommandInfo::available`].
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Open(_) => "open",
+            Command::File(_) => "file",
+            Command::Stats => "stats",
+            Command::Quit => "quit",
+            Command::Help => "help",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParseError {
     #[error("empty command")]

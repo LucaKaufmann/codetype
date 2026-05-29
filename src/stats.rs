@@ -35,6 +35,24 @@ pub struct SessionStats {
     pub total_time: Duration,
 }
 
+impl SessionStats {
+    /// Aggregate characters-per-minute across the whole session.
+    pub fn cpm(&self) -> f64 {
+        cpm(self.total_correct_chars, self.total_time)
+    }
+
+    /// Aggregate words-per-minute (`cpm` / `CHARS_PER_WORD`). Shares the exact
+    /// math the per-Exercise stats use, so the two screens can't diverge.
+    pub fn wpm(&self) -> f64 {
+        wpm(self.total_correct_chars, self.total_time)
+    }
+
+    /// Aggregate accuracy: correct / (correct + errors); 1.0 if no attempts.
+    pub fn accuracy(&self) -> f64 {
+        accuracy(self.total_correct_chars, self.total_errors)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExerciseStats {
     pub wpm: f64,
@@ -274,6 +292,30 @@ mod tests {
         // 100 / (100 + 3) ≈ 0.9708
         assert!((stats.accuracy - 100.0 / 103.0).abs() < 1e-9);
         assert_eq!(stats.top_mistakes, vec![('=', 2), ('{', 1)]);
+    }
+
+    #[test]
+    fn session_stats_methods_delegate_to_shared_math() {
+        let s = SessionStats {
+            exercises_completed: 1,
+            total_correct_chars: 300,
+            total_errors: 0,
+            total_time: secs(60),
+        };
+        // 300 chars / 1 min = 300 cpm → 60 wpm; no errors → 100% accuracy.
+        assert_eq!(s.cpm(), 300.0);
+        assert_eq!(s.wpm(), 60.0);
+        assert_eq!(s.accuracy(), 1.0);
+
+        let mixed = SessionStats {
+            exercises_completed: 1,
+            total_correct_chars: 40,
+            total_errors: 10,
+            total_time: secs(1),
+        };
+        assert_eq!(mixed.accuracy(), 0.8);
+        // No attempts → 100% (avoids 0/0).
+        assert_eq!(SessionStats::default().accuracy(), 1.0);
     }
 
     #[test]

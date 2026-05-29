@@ -15,6 +15,24 @@ Ranked most-severe first. Severity: **P1** = should fix before release ·
 **P2** = maintainability/correctness worth fixing · **P3** = minor · **P4** =
 micro.
 
+## Resolution (this branch)
+
+Findings **#1–#4 were fixed** in the follow-up commit on this branch
+(185 tests pass, clippy + fmt clean):
+
+- **#1** — `render`'s `Palette` arm now draws only `palette_overlay` into
+  `chunks[1]` (no prior-body render underneath) and no longer returns early, so
+  there's no bleed-through and the footer hint renders.
+- **#2** — added `SessionStats::{cpm,wpm,accuracy}` in `stats.rs` (reusing the
+  canonical private helpers); `app.rs` calls those, and the duplicated
+  `cumulative_cpm`/`session_wpm`/`session_accuracy` (and their tests) are gone.
+- **#3 + #4** — `execute_command` now gates "not yet implemented" on
+  `command::info(name).available` (single source of truth, shared with the
+  palette), via a new `Command::name()`. This also gives the previously-dead
+  `command::info()` a real production caller.
+
+Findings **#5–#9 remain open** (minor / altitude polish).
+
 ---
 
 ## 1. [P1 · correctness/UX] Palette overlay bleeds the body through — `src/app.rs:516–526`
