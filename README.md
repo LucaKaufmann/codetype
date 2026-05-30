@@ -43,6 +43,8 @@ you'll use for real.
 Clone the repository, then install the binary with Cargo:
 
 ```bash
+git clone https://github.com/LucaKaufmann/codetype.git
+cd codetype
 cargo install --path .
 ```
 
