@@ -8,9 +8,7 @@ code in a local Git repository using [tree-sitter](https://tree-sitter.github.io
 then has you type them. Build muscle memory on the syntax, identifiers, and
 patterns you work with every day.
 
-<!-- TODO: add demo gif / asciinema cast here, e.g.
-     ![CodeType demo](docs/demo.gif)
-     or an asciinema embed. -->
+![CodeType drilling its own source in the terminal](assets/screenshot.png)
 
 ## Why
 
