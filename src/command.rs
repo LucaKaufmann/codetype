@@ -379,7 +379,11 @@ mod tests {
     fn command_info_descriptions_are_nonempty() {
         // The single source of truth: every entry has a usable description.
         for i in COMMAND_INFO {
-            assert!(!i.description.is_empty(), "{} has an empty description", i.name);
+            assert!(
+                !i.description.is_empty(),
+                "{} has an empty description",
+                i.name
+            );
         }
     }
 
