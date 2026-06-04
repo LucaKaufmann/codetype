@@ -134,6 +134,9 @@ pub struct Leaderboard {
     /// Table rows we parsed but couldn't understand (hand-edited / corrupt).
     /// Re-emitted untouched so a stray edit never costs someone their data.
     opaque_rows: Vec<String>,
+    /// Anything after the table (team notes, house rules, …), preserved
+    /// verbatim so a submit never deletes content a human added below the board.
+    postamble: String,
 }
 
 /// The result of recording a session — everything the terminal "you placed
@@ -190,6 +193,7 @@ impl Leaderboard {
             preamble: DEFAULT_PREAMBLE.to_string(),
             rows: BTreeMap::new(),
             opaque_rows: Vec::new(),
+            postamble: String::new(),
         }
     }
 
@@ -210,17 +214,18 @@ impl Leaderboard {
                 },
                 rows: BTreeMap::new(),
                 opaque_rows: Vec::new(),
+                postamble: String::new(),
             };
         };
 
         let preamble = lines[..header_idx].join("\n").trim_end().to_string();
         let mut rows = BTreeMap::new();
         let mut opaque_rows = Vec::new();
+        let mut postamble = String::new();
 
-        // Data rows start after the header and its `---` separator. Stop at the
-        // first non-table line (the tool owns the file from the header down, so
-        // we don't expect trailing prose, but we won't loop past it either).
-        for line in lines.iter().skip(header_idx + 1) {
+        // Data rows start after the header and its `---` separator.
+        let body = &lines[header_idx + 1..];
+        for (i, line) in body.iter().enumerate() {
             let trimmed = line.trim();
             // A table row always contains at least one `|` cell delimiter; the
             // first line without one ends the table (a blank line or trailing
@@ -228,6 +233,9 @@ impl Leaderboard {
             // loop consistent with `split_row`/`is_header_row`, which both
             // tolerate a missing leading pipe.
             if !trimmed.contains('|') {
+                // Everything from here on is content below the table — keep it
+                // verbatim so a submit never deletes a team's notes.
+                postamble = body[i..].join("\n").trim().to_string();
                 break;
             }
             if is_separator_row(trimmed) {
@@ -249,6 +257,7 @@ impl Leaderboard {
             },
             rows,
             opaque_rows,
+            postamble,
         }
     }
 
@@ -269,6 +278,11 @@ impl Leaderboard {
         }
         for raw in &self.opaque_rows {
             out.push_str(raw);
+            out.push('\n');
+        }
+        if !self.postamble.is_empty() {
+            out.push('\n');
+            out.push_str(&self.postamble);
             out.push('\n');
         }
         out
@@ -557,6 +571,22 @@ mod tests {
         let board = Leaderboard::parse(doc);
         assert!(board.opaque_rows.is_empty());
         assert_eq!(board.record("Luca", "rust").unwrap().sessions, 1);
+    }
+
+    #[test]
+    fn content_after_the_table_is_preserved_across_a_submit() {
+        let doc = "# CodeType Leaderboard\n\n\
+            | Player | Lang | Best WPM | Avg WPM | Accuracy | Sessions | Last played |\n\
+            | --- | --- | ---: | ---: | ---: | ---: | --- |\n\
+            | Luca | rust | 71.0 | 71.0 | 95.0% | 1 | 2026-06-04 |\n\
+            \n## House rules\n\nFastest by Friday buys the coffee.\n";
+        let mut board = Leaderboard::parse(doc);
+        // A later submit must update the table without deleting the notes below.
+        board.record_session("Sam", "rust", &session(80.0, 0.95), "2026-06-05");
+        let rendered = board.render();
+        assert!(rendered.contains("| Sam | rust |"));
+        assert!(rendered.contains("## House rules"));
+        assert!(rendered.contains("Fastest by Friday buys the coffee."));
     }
 
     #[test]
