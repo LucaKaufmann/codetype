@@ -234,8 +234,17 @@ impl Leaderboard {
             // tolerate a missing leading pipe.
             if !trimmed.contains('|') {
                 // Everything from here on is content below the table — keep it
-                // verbatim so a submit never deletes a team's notes.
-                postamble = body[i..].join("\n").trim().to_string();
+                // verbatim so a submit never deletes a team's notes. Strip only
+                // the structural newlines (the blank line separating it from the
+                // table, plus trailing newlines); a plain `.trim()` would also
+                // eat the leading whitespace of an indented code block and
+                // change its meaning. The single separator newline is re-added
+                // by `render`.
+                postamble = body[i..]
+                    .join("\n")
+                    .trim_start_matches('\n')
+                    .trim_end_matches('\n')
+                    .to_string();
                 break;
             }
             if is_separator_row(trimmed) {
@@ -587,6 +596,28 @@ mod tests {
         assert!(rendered.contains("| Sam | rust |"));
         assert!(rendered.contains("## House rules"));
         assert!(rendered.contains("Fastest by Friday buys the coffee."));
+    }
+
+    #[test]
+    fn indented_postamble_keeps_its_indentation() {
+        // An indented code block immediately after the table-separating blank
+        // line must survive verbatim — `.trim()` used to eat the leading
+        // 4 spaces and turn it into a paragraph.
+        let doc = "# CodeType Leaderboard\n\n\
+            | Player | Lang | Best WPM | Avg WPM | Accuracy | Sessions | Last played |\n\
+            | --- | --- | ---: | ---: | ---: | ---: | --- |\n\
+            | Luca | rust | 71.0 | 71.0 | 95.0% | 1 | 2026-06-04 |\n\
+            \n    let indented = code_block();\n";
+
+        let mut board = Leaderboard::parse(doc);
+        board.record_session("Sam", "rust", &session(80.0, 0.95), "2026-06-05");
+        let rendered = board.render();
+        assert!(rendered.contains("\n    let indented = code_block();"));
+
+        // Stable: a second submit doesn't drift the indentation either.
+        let mut board2 = Leaderboard::parse(&rendered);
+        board2.record_session("Sam", "rust", &session(70.0, 0.95), "2026-06-06");
+        assert!(board2.render().contains("\n    let indented = code_block();"));
     }
 
     #[test]
