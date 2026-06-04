@@ -56,17 +56,24 @@ pub struct Identity {
 /// else git's `user.name`, else `user.email`. `None` means "can't tell who you
 /// are" — the caller suppresses the submit prompt rather than guessing.
 pub fn resolve_identity(repo: &Path, override_name: Option<&str>) -> Option<Identity> {
-    if let Some(name) = override_name {
-        let name = name.trim();
-        if !name.is_empty() {
-            return Some(Identity {
-                name: name.to_string(),
-            });
-        }
-    }
-    git_config(repo, "user.name")
-        .or_else(|| git_config(repo, "user.email"))
-        .map(|name| Identity { name })
+    let raw = match override_name {
+        Some(name) if !name.trim().is_empty() => name.to_string(),
+        _ => git_config(repo, "user.name").or_else(|| git_config(repo, "user.email"))?,
+    };
+    let name = sanitize_name(&raw);
+    (!name.is_empty()).then_some(Identity { name })
+}
+
+/// Strip characters that would corrupt the Markdown table: the `|` column
+/// delimiter and any control characters (newlines, tabs). Internal whitespace
+/// is collapsed and the result trimmed, so the mapping is stable — the same
+/// person always resolves to the same row key.
+fn sanitize_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c == '|' || c.is_control() { ' ' } else { c })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Read a single git config value as seen from `repo` (merged global + local).
@@ -155,6 +162,18 @@ impl Leaderboard {
 
     /// Write the rendered board to `path`.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        // Refuse to write through a symlink. The target is always
+        // `<repo>/CODETYPE.md`, so a symlink is the only way this write could
+        // escape the repo — an untrusted repo could plant one pointing at an
+        // arbitrary user-writable file to be clobbered when the user submits.
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.file_type().is_symlink()
+        {
+            anyhow::bail!(
+                "{} is a symlink; refusing to write scores through it",
+                path.display()
+            );
+        }
         std::fs::write(path, self.render()).with_context(|| format!("write {}", path.display()))
     }
 
@@ -586,6 +605,62 @@ mod tests {
         assert_eq!(sam.total, 2);
         let ada = board.record_session("Ada", "swift", &session(50.0, 0.9), "2026-06-05");
         assert_eq!(ada.rank, 2);
+    }
+
+    // -- identity sanitizing --
+
+    #[test]
+    fn sanitize_name_strips_table_breakers() {
+        assert_eq!(sanitize_name("a|b"), "a b"); // pipe would add a phantom cell
+        assert_eq!(sanitize_name("Luca\n"), "Luca"); // newline would split the row
+        assert_eq!(sanitize_name("  Ada  Lovelace  "), "Ada Lovelace");
+    }
+
+    #[test]
+    fn identity_override_is_sanitized() {
+        // A `|` in the handle can't leak into the table and corrupt the row.
+        let id = resolve_identity(Path::new("."), Some("ev|l")).unwrap();
+        assert_eq!(id.name, "ev l");
+    }
+
+    #[test]
+    fn pipe_safe_name_round_trips_through_the_table() {
+        let mut board = Leaderboard::empty();
+        let name = sanitize_name("a|b");
+        board.record_session(&name, "rust", &session(70.0, 0.95), "2026-06-04");
+        let reparsed = Leaderboard::parse(&board.render());
+        // The row survives as a real (parsed) row, not an opaque one.
+        assert!(reparsed.opaque_rows.is_empty());
+        assert_eq!(reparsed.record(&name, "rust").unwrap().sessions, 1);
+    }
+
+    // -- IO: save / load --
+
+    #[test]
+    fn save_then_load_round_trips_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CODETYPE.md");
+        let mut board = Leaderboard::empty();
+        board.record_session("Luca", "rust", &session(70.0, 0.95), "2026-06-04");
+        board.save(&path).unwrap();
+        let loaded = Leaderboard::load(&path).unwrap();
+        assert_eq!(loaded.record("Luca", "rust").unwrap().sessions, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_to_write_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.txt");
+        std::fs::write(&target, "do not touch").unwrap();
+        let link = dir.path().join("CODETYPE.md");
+        symlink(&target, &link).unwrap();
+
+        let board = Leaderboard::empty();
+        assert!(board.save(&link).is_err());
+        // The symlink target is left untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "do not touch");
     }
 
     // -- placement message --
