@@ -222,7 +222,12 @@ impl Leaderboard {
         // we don't expect trailing prose, but we won't loop past it either).
         for line in lines.iter().skip(header_idx + 1) {
             let trimmed = line.trim();
-            if !trimmed.starts_with('|') {
+            // A table row always contains at least one `|` cell delimiter; the
+            // first line without one ends the table (a blank line or trailing
+            // prose). Gating on `contains` rather than `starts_with` keeps the
+            // loop consistent with `split_row`/`is_header_row`, which both
+            // tolerate a missing leading pipe.
+            if !trimmed.contains('|') {
                 break;
             }
             if is_separator_row(trimmed) {
@@ -535,6 +540,20 @@ mod tests {
             | Player | Lang | Best WPM | Avg WPM | Accuracy | Sessions | Last played\n\
             | --- | --- | ---: | ---: | ---: | ---: | ---\n\
             | Luca | rust | 71.0 | 71.0 | 95.0% | 1 | 2026-06-04\n";
+        let board = Leaderboard::parse(doc);
+        assert!(board.opaque_rows.is_empty());
+        assert_eq!(board.record("Luca", "rust").unwrap().sessions, 1);
+    }
+
+    #[test]
+    fn parses_a_table_without_leading_pipes() {
+        // GitHub-flavored Markdown also allows omitting the *leading* pipe. The
+        // whole table (header, separator, rows) must still be read — not partly
+        // recognized and then dropped, which would erase an existing board.
+        let doc = "# CodeType Leaderboard\n\n\
+            Player | Lang | Best WPM | Avg WPM | Accuracy | Sessions | Last played\n\
+            --- | --- | ---: | ---: | ---: | ---: | ---\n\
+            Luca | rust | 71.0 | 71.0 | 95.0% | 1 | 2026-06-04\n";
         let board = Leaderboard::parse(doc);
         assert!(board.opaque_rows.is_empty());
         assert_eq!(board.record("Luca", "rust").unwrap().sessions, 1);
