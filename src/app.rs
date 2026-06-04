@@ -28,6 +28,7 @@ use crate::engine::{CharStatus, Mode, TypingEngine};
 use crate::exercise::Exercise;
 use crate::extractor::{Extractor, registry};
 use crate::scanner::{self, RepoScanner};
+use crate::scores::{self, Identity};
 use crate::stats::{ExerciseStats, SessionStats, StatsCollector};
 use crate::tour::RepoTour;
 
@@ -71,9 +72,13 @@ pub fn print_exercises(repo: &Path, count: usize, lang: Option<String>) -> anyho
 }
 
 /// Public entry point. Owns the terminal lifecycle and the event loop.
-pub fn run(repo: &Path, mode: Mode, lang: Option<String>) -> anyhow::Result<()> {
+pub fn run(repo: &Path, mode: Mode, lang: Option<String>, as_name: Option<String>) -> anyhow::Result<()> {
     let extractor = select_extractor(repo, lang.as_deref())?;
     let language = extractor.language().to_string();
+    // Resolve who to attribute scores to *before* the TUI starts, so any git
+    // subprocess noise can't corrupt the alternate screen. `None` means we
+    // can't tell — the submit prompt is suppressed in that case.
+    let identity = scores::resolve_identity(repo, as_name.as_deref());
     let mut tour = build_tour(repo, &extractor)?;
     let initial_exercise = tour
         .next()
@@ -92,19 +97,45 @@ pub fn run(repo: &Path, mode: Mode, lang: Option<String>) -> anyhow::Result<()> 
     // RAII guard restores the terminal on panic or early return.
     let _guard = TerminalGuard;
 
-    let result = event_loop(
+    let outcome = event_loop(
         &mut terminal,
         tour,
         initial_exercise,
         repo_label,
-        language,
+        language.clone(),
         mode,
+        identity.is_some(),
     );
 
     // Explicit restore in addition to the guard, so the cursor reappears
     // even on the happy path.
     let _ = restore_terminal(&mut terminal);
-    result
+
+    // Persist *after* teardown: file IO and the placement line both belong in
+    // normal scrollback, not the alternate screen.
+    let outcome = outcome?;
+    if outcome.submit
+        && let Some(identity) = &identity
+    {
+        print_placement(repo, identity, &language, &outcome.session)?;
+    }
+    Ok(())
+}
+
+/// Fold the finished session into `repo/CODETYPE.md` and print where the player
+/// landed. Called only on an explicit submit, after the terminal is restored.
+fn print_placement(
+    repo: &Path,
+    identity: &Identity,
+    language: &str,
+    session: &SessionStats,
+) -> anyhow::Result<()> {
+    let path = repo.join("CODETYPE.md");
+    let mut board = scores::Leaderboard::load(&path)?;
+    let placement = board.record_session(&identity.name, language, session, &scores::today());
+    board.save(&path)?;
+    println!("{}", placement.message());
+    Ok(())
 }
 
 // -- Pipeline construction ---------------------------------------------------
@@ -214,12 +245,25 @@ enum AppState {
         // so it carries no copy of the stats.
         prior: Box<AppState>,
     },
+    // Quit-time prompt: "submit this session to CODETYPE.md?" Carries no prior
+    // because both answers quit — `y` submits, anything else exits clean.
+    ConfirmSubmit,
 }
 
 enum Action {
     Stay,
     To(AppState),
     Quit,
+    /// Quit *and* persist the session to the leaderboard (the `y` answer to
+    /// [`AppState::ConfirmSubmit`]).
+    QuitAndSubmit,
+}
+
+/// What `event_loop` reports back so `run` can persist after the terminal is
+/// torn down (keeping file IO and stdout out of the raw-mode loop).
+struct SessionOutcome {
+    submit: bool,
+    session: SessionStats,
 }
 
 // -- Event loop --------------------------------------------------------------
@@ -231,7 +275,8 @@ fn event_loop(
     repo_label: String,
     language: String,
     mode: Mode,
-) -> anyhow::Result<()> {
+    can_submit: bool,
+) -> anyhow::Result<SessionOutcome> {
     let mut state = AppState::Typing {
         engine: TypingEngine::new_with_mode(initial_exercise, mode),
         started: None,
@@ -278,10 +323,31 @@ fn event_loop(
         match action {
             Action::Stay => {}
             Action::To(new) => state = new,
-            Action::Quit => break,
+            Action::Quit => {
+                // Intercept the first quit with the submit prompt — but only if
+                // there's a session worth submitting and we know who the player
+                // is. From the prompt itself (or with nothing to submit), quit
+                // for real without writing.
+                if can_submit
+                    && stats_collector.session().exercises_completed > 0
+                    && !matches!(state, AppState::ConfirmSubmit)
+                {
+                    state = AppState::ConfirmSubmit;
+                } else {
+                    return Ok(SessionOutcome {
+                        submit: false,
+                        session: stats_collector.session().clone(),
+                    });
+                }
+            }
+            Action::QuitAndSubmit => {
+                return Ok(SessionOutcome {
+                    submit: true,
+                    session: stats_collector.session().clone(),
+                });
+            }
         }
     }
-    Ok(())
 }
 
 fn handle_key(
@@ -302,6 +368,7 @@ fn handle_key(
         AppState::Palette { input, prior } => handle_palette_key(input, prior, key, tour, notice),
         AppState::Help { prior } => handle_help_key(prior, key),
         AppState::SessionStats { prior } => handle_session_stats_key(prior, key),
+        AppState::ConfirmSubmit => handle_confirm_submit_key(key),
     };
 
     // Notice lifetime: a notice this keypress just set (so `*notice` changed)
@@ -423,6 +490,16 @@ fn handle_session_stats_key(prior: &mut Box<AppState>, key: KeyEvent) -> Action 
     // not a top-level screen, so Esc here means "dismiss," consistent with Help.)
     let _ = key;
     return_to_prior(prior)
+}
+
+/// The quit-time submit prompt. `y` submits and quits; anything else (the
+/// default) quits without writing — so a write only ever follows an explicit
+/// yes.
+fn handle_confirm_submit_key(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Char('y' | 'Y') => Action::QuitAndSubmit,
+        _ => Action::Quit,
+    }
 }
 
 fn execute_command(
@@ -557,6 +634,7 @@ fn render(
         AppState::Palette { input, .. } => f.render_widget(palette_overlay(input), chunks[1]),
         AppState::Help { .. } => f.render_widget(help_body(), chunks[1]),
         AppState::SessionStats { .. } => f.render_widget(session_stats_body(session), chunks[1]),
+        AppState::ConfirmSubmit => f.render_widget(confirm_submit_body(session), chunks[1]),
     }
 
     if let Some(msg) = notice {
@@ -593,6 +671,7 @@ fn header<'a>(
         },
         AppState::Help { .. } => ("help".to_string(), String::new()),
         AppState::SessionStats { .. } => ("session".to_string(), String::new()),
+        AppState::ConfirmSubmit => ("quit".to_string(), String::new()),
     };
 
     let session_summary = format!(
@@ -830,6 +909,33 @@ fn session_stats_body(s: &SessionStats) -> Paragraph<'_> {
     Paragraph::new(Text::from(lines))
 }
 
+/// The quit-time submit confirmation. Shows what's about to be written and the
+/// y/N choice; the footer carries the key hints.
+fn confirm_submit_body(s: &SessionStats) -> Paragraph<'_> {
+    let lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "  Submit this session to CODETYPE.md?",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(format!(
+            "  {} exercises  ·  {:.1} WPM  ·  {:.1}% accuracy",
+            s.exercises_completed,
+            s.wpm(),
+            s.accuracy() * 100.0,
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "  y  submit & quit        any other key  quit without saving",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    Paragraph::new(Text::from(lines))
+}
+
 fn notice_line(msg: &str) -> Paragraph<'_> {
     Paragraph::new(Span::styled(
         format!("  {msg}"),
@@ -846,6 +952,7 @@ fn footer(state: &AppState) -> Paragraph<'static> {
         AppState::Palette { .. } => "Esc: cancel  ·  Enter: run",
         AppState::Help { .. } => "any key to return  ·  q: quit",
         AppState::SessionStats { .. } => "any key to return",
+        AppState::ConfirmSubmit => "y: submit & quit  ·  any other key: quit",
     };
     Paragraph::new(Span::styled(hints, Style::default().fg(Color::DarkGray)))
 }
