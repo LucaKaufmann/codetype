@@ -24,6 +24,7 @@ point it at, so you drill the keystrokes you'll actually use.
 - A distraction-free terminal UI built with [ratatui](https://ratatui.rs/)
   and [crossterm](https://github.com/crossterm-rs/crossterm).
 - Single static binary, no runtime dependencies beyond `git`.
+- Optional `CODETYPE.md` leaderboard you can commit and compete on as a team.
 - Debug `--print` mode to inspect extracted exercises.
 
 ## Supported languages
@@ -50,7 +51,7 @@ This builds and installs the `codetype` binary into your Cargo bin directory
 ## Usage
 
 ```
-codetype <path-to-repo> [--lang <lang>] [--strict]
+codetype <path-to-repo> [--lang <lang>] [--strict] [--as <name>]
 ```
 
 **Auto-detect the language** (infers the dominant language from the repo's
@@ -82,6 +83,39 @@ codetype ~/path/to/repo --print
 codetype ~/path/to/repo --print --count 10
 ```
 
+## Tracking scores
+
+CodeType can keep a running record of how you do across sessions in a
+`CODETYPE.md` file at the root of the repo you're drilling. Check it into git
+and a whole team gets a shared leaderboard, rendered as a table right on the
+repo page.
+
+Nothing is written unless you ask. When you quit a session that completed at
+least one exercise, CodeType asks:
+
+```
+Submit this session to CODETYPE.md? [y/N]
+```
+
+Press <kbd>y</kbd> to fold the session into the leaderboard and write the file;
+any other key quits without touching anything. After submitting, you get a line
+telling you where you placed.
+
+Each row tracks best and average WPM, accuracy, session count, and the date you
+last played — split per language, with an `overall` rollup per player. Rows are
+sorted by name (not score), so everyone only ever edits their own rows and
+concurrent submissions merge cleanly in git.
+
+You're identified by your git `user.name` (falling back to `user.email`). To use
+a handle instead, pass `--as`:
+
+```bash
+codetype ~/path/to/repo --as speedy
+```
+
+Scores are plain text and on the honor system — there's no tamper-proofing, by
+design.
+
 ## Modes
 
 - **Lenient** (default). Monkeytype-style: a wrong key still advances the
@@ -101,6 +135,7 @@ codetype ~/path/to/repo --print --count 10
 | <kbd>:</kbd>   | Open the command palette                 |
 | <kbd>?</kbd>   | Show help                                |
 | <kbd>q</kbd>   | Quit (on the stats screen)               |
+| <kbd>y</kbd>   | Submit the session (on the quit prompt)  |
 
 ## Requires a Git repository
 
@@ -112,8 +147,8 @@ an error.
 ## Roadmap and known limitations
 
 - No `.tsx` yet. Only plain `.ts` TypeScript files are parsed.
-- No cross-session progress. Each session is independent; tracking "files you
-  haven't drilled before" across runs isn't built yet.
+- The `CODETYPE.md` leaderboard tracks scores across sessions, but exercise
+  selection still doesn't remember which files you've already drilled.
 - More languages and smarter exercise selection are on the list.
 
 ## Contributing
