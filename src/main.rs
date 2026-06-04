@@ -15,6 +15,11 @@ struct Cli {
     #[arg(long)]
     lang: Option<String>,
 
+    /// Name to record scores under in CODETYPE.md. Overrides the git identity
+    /// (user.name / user.email) — handy for a handle instead of your real name.
+    #[arg(long = "as")]
+    as_name: Option<String>,
+
     /// Use strict mode: wrong keystrokes do not advance the cursor — the
     /// user must type the expected key to make progress. Default is lenient
     /// mode (Monkeytype-style: wrong keys advance, backspace to fix).
@@ -42,6 +47,6 @@ fn main() -> anyhow::Result<()> {
         } else {
             Mode::Lenient
         };
-        codetype::app::run(&cli.repo, mode, cli.lang)
+        codetype::app::run(&cli.repo, mode, cli.lang, cli.as_name)
     }
 }
