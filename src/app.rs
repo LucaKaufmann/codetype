@@ -882,7 +882,6 @@ fn format_elapsed(d: Duration) -> String {
     format!("{mins}:{secs:02}")
 }
 
-
 /// Elapsed wall-clock for a maybe-started timer. `None` (not yet typed) reads
 /// as zero so the header shows 0:00 before the first keystroke.
 fn elapsed_or_zero(started: Option<Instant>) -> Duration {
@@ -910,5 +909,4 @@ mod tests {
         let d = elapsed_or_zero(Some(Instant::now()));
         assert!(d < Duration::from_secs(1));
     }
-
 }

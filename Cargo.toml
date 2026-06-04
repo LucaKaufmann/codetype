@@ -2,6 +2,7 @@
 name = "codetype"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 authors = ["Luca Kaufmann <lucakaufmann92@gmail.com>"]
 description = "A terminal typing trainer that turns your own Git repository's source code into typing exercises using tree-sitter."
 license = "MIT"
