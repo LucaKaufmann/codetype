@@ -15,6 +15,7 @@
 //!   `LanguageConfig` implementations (`swift`, `rust`, `typescript`) wired up
 //!   through `registry`.
 //! - [`scanner`] — enumerates candidate source files in the repository.
+//! - [`scores`] — persistent, checked-in `CODETYPE.md` leaderboard.
 //! - [`stats`] — accuracy and speed metrics for a completed run.
 //! - [`tour`] — round-robin selection of which exercise to present next.
 
@@ -24,5 +25,6 @@ pub mod engine;
 pub mod exercise;
 pub mod extractor;
 pub mod scanner;
+pub mod scores;
 pub mod stats;
 pub mod tour;
