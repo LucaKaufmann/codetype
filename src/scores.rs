@@ -92,6 +92,22 @@ fn git_config(repo: &Path, key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Refuse to read or write `path` if it's a symlink. CodeType drills arbitrary,
+/// possibly untrusted repos; the score file is always `<repo>/CODETYPE.md`, so
+/// a symlink is the only way IO could escape the repo — redirecting a *read* to
+/// a huge/special file (hang/OOM) or a *write* to clobber an external file.
+fn reject_symlink(path: &Path) -> anyhow::Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "{} is a symlink; refusing to use it for scores",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// One player's stats for one language (or the `overall` rollup). Averages are
 /// display-ready values updated by a running formula (see
 /// [`Leaderboard::record_session`]); we deliberately don't keep the raw totals,
@@ -153,6 +169,9 @@ impl Leaderboard {
     /// missing. Other IO errors propagate — the caller decides whether a
     /// stats-file problem should be fatal.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        // Guard *before* reading: a symlinked CODETYPE.md (e.g. → /dev/zero)
+        // would hang or exhaust memory in `read_to_string` otherwise.
+        reject_symlink(path)?;
         match std::fs::read_to_string(path) {
             Ok(content) => Ok(Self::parse(&content)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty()),
@@ -162,18 +181,7 @@ impl Leaderboard {
 
     /// Write the rendered board to `path`.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        // Refuse to write through a symlink. The target is always
-        // `<repo>/CODETYPE.md`, so a symlink is the only way this write could
-        // escape the repo — an untrusted repo could plant one pointing at an
-        // arbitrary user-writable file to be clobbered when the user submits.
-        if let Ok(meta) = std::fs::symlink_metadata(path)
-            && meta.file_type().is_symlink()
-        {
-            anyhow::bail!(
-                "{} is a symlink; refusing to write scores through it",
-                path.display()
-            );
-        }
+        reject_symlink(path)?;
         std::fs::write(path, self.render()).with_context(|| format!("write {}", path.display()))
     }
 
@@ -664,7 +672,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn save_refuses_to_write_through_a_symlink() {
+    fn load_and_save_refuse_a_symlinked_path() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("secret.txt");
@@ -672,8 +680,10 @@ mod tests {
         let link = dir.path().join("CODETYPE.md");
         symlink(&target, &link).unwrap();
 
-        let board = Leaderboard::empty();
-        assert!(board.save(&link).is_err());
+        // load() refuses before reading through the link...
+        assert!(Leaderboard::load(&link).is_err());
+        // ...and save() refuses before writing through it.
+        assert!(Leaderboard::empty().save(&link).is_err());
         // The symlink target is left untouched.
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "do not touch");
     }
