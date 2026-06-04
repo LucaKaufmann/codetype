@@ -362,11 +362,12 @@ fn is_separator_row(line: &str) -> bool {
 /// edges produced by the leading/trailing pipes.
 fn split_row(line: &str) -> Vec<String> {
     let trimmed = line.trim();
-    let inner = trimmed
-        .strip_prefix('|')
-        .unwrap_or(trimmed)
-        .strip_suffix('|')
-        .unwrap_or(trimmed);
+    // The leading/trailing pipes are both optional in GitHub-flavored Markdown.
+    // Strip them independently — note the suffix step falls back to the
+    // *prefix-stripped* string, not the original, so a row without a trailing
+    // pipe doesn't re-introduce a phantom leading empty cell.
+    let without_prefix = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = without_prefix.strip_suffix('|').unwrap_or(without_prefix);
     inner.split('|').map(|c| c.trim().to_string()).collect()
 }
 
@@ -515,6 +516,20 @@ mod tests {
             | Luca | rust | 71.0 | 71.0 | 95.0% | 1 | 2026-06-04 |\n";
         let board = Leaderboard::parse(doc);
         assert!(board.render().contains("Type fast or perish."));
+    }
+
+    #[test]
+    fn parses_rows_without_a_trailing_pipe() {
+        // GitHub-flavored Markdown allows omitting the closing pipe; a
+        // formatter or hand-edit can rewrite the file this way. We must still
+        // detect the header and parse the rows (not append a second table).
+        let doc = "# CodeType Leaderboard\n\n\
+            | Player | Lang | Best WPM | Avg WPM | Accuracy | Sessions | Last played\n\
+            | --- | --- | ---: | ---: | ---: | ---: | ---\n\
+            | Luca | rust | 71.0 | 71.0 | 95.0% | 1 | 2026-06-04\n";
+        let board = Leaderboard::parse(doc);
+        assert!(board.opaque_rows.is_empty());
+        assert_eq!(board.record("Luca", "rust").unwrap().sessions, 1);
     }
 
     #[test]
